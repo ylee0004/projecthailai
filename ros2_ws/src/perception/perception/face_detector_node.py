@@ -46,8 +46,10 @@ class FaceDetectorNode(Node):
             min_detection_confidence=0.6
         )
 
-        # OpenCV capture
-        self.cap = self._init_source()
+        # OpenCV capture / image load
+        self.cap = None
+        self.static_frame = None
+        self._init_source()
 
         # Timer
         self.timer = self.create_timer(
@@ -61,34 +63,43 @@ class FaceDetectorNode(Node):
 
     def _init_source(self):
         if self.source == 'webcam':
-            cap = cv2.VideoCapture(0)
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                raise RuntimeError('Cannot open webcam')
             self.get_logger().info('Using webcam (device 0)')
-        elif self.source in ('video', 'image'):
+
+        elif self.source == 'image':
             if not self.file_path:
-                self.get_logger().error('file_path parameter is required for image/video source')
-                raise ValueError('file_path is empty')
-            cap = cv2.VideoCapture(self.file_path)
-            self.get_logger().info(f'Using file: {self.file_path}')
+                raise ValueError('file_path is required for image source')
+            self.static_frame = cv2.imread(self.file_path)
+            if self.static_frame is None:
+                raise RuntimeError(f'Cannot read image: {self.file_path}')
+            self.get_logger().info(f'Loaded image: {self.file_path}')
+
+        elif self.source == 'video':
+            if not self.file_path:
+                raise ValueError('file_path is required for video source')
+            self.cap = cv2.VideoCapture(self.file_path)
+            if not self.cap.isOpened():
+                raise RuntimeError(f'Cannot open video: {self.file_path}')
+            self.get_logger().info(f'Using video: {self.file_path}')
+
         else:
             raise ValueError(f'Unknown source: {self.source}')
 
-        if not cap.isOpened():
-            self.get_logger().error('Failed to open video source')
-            raise RuntimeError('Cannot open video source')
-
-        return cap
-
     def process_frame(self):
-        ret, frame = self.cap.read()
-
-        # For image files: loop indefinitely
-        if not ret:
-            if self.source in ('image', 'video'):
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
+        # Get frame based on source type
+        if self.source == 'image':
+            frame = self.static_frame.copy()
+        else:
+            ret, frame = self.cap.read()
             if not ret:
-                self.get_logger().warn('Cannot read frame')
-                return
+                if self.source == 'video':
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                if not ret:
+                    self.get_logger().warn('Cannot read frame')
+                    return
 
         h, w = frame.shape[:2]
         frame_center_x = w / 2
