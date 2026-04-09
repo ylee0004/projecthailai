@@ -1,4 +1,22 @@
-float32 x           # normalized offset: -1.0 (left) to 1.0 (right)
-float32 y           # normalized offset: -1.0 (down) to 1.0 (up)
-float32 confidence  # detection confidence: 0.0 to 1.0
-bool    detected    # true if face is present in frame
+# FaceOffset.msg — Project Hail AI
+#
+# 이 메시지의 역할:
+#   FaceDetectorNode(perception)와 ServoControllerNode(control) 사이의
+#   데이터 인터페이스. 감지된 얼굴의 화면 중앙 기준 위치를 전달한다.
+#
+# 좌표계:
+#   원점(0, 0) = 화면 정중앙
+#   x 양수 = 오른쪽,  x 음수 = 왼쪽
+#   y 양수 = 위쪽,    y 음수 = 아래쪽
+#   범위: -1.0 ~ 1.0 (화면 크기에 무관한 정규화값)
+#
+# 사용 예:
+#   x=0.0,  y=0.0  → 얼굴이 화면 정중앙 (서보 보정 불필요)
+#   x=0.5,  y=0.0  → 얼굴이 오른쪽 절반 지점 → 카메라를 오른쪽으로 회전
+#   x=-0.3, y=0.2  → 얼굴이 왼쪽 아래 → 카메라를 왼쪽 위로 이동
+#   detected=false  → 얼굴 없음 → 서보 현재 위치 유지
+
+float32 x           # 좌우 오프셋: -1.0(왼쪽) ~ 0.0(중앙) ~ 1.0(오른쪽)
+float32 y           # 상하 오프셋: -1.0(아래) ~ 0.0(중앙) ~ 1.0(위)
+float32 confidence  # 감지 확신도: 0.0(낮음) ~ 1.0(높음), 0.6 이상이면 신뢰 가능
+bool    detected    # 얼굴 감지 여부: true=감지됨, false=감지 안됨
