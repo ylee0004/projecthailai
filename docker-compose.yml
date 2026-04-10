@@ -57,8 +57,8 @@ services:
       # ghcr.io 인증 정보
       - /root/.docker/config.json:/config.json:ro
     environment:
-      # 300초(5분)마다 새 이미지 확인
-      - WATCHTOWER_POLL_INTERVAL=300
+      # 86400초(24시간)마다 새 이미지 확인
+      - WATCHTOWER_POLL_INTERVAL=86400
       # label이 있는 컨테이너만 업데이트
       - WATCHTOWER_LABEL_ENABLE=true
       # 업데이트 후 오래된 이미지 자동 삭제
