@@ -1,0 +1,90 @@
+# .github/workflows/build.yml — Project Hail AI CI/CD
+#
+# 트리거: main 브랜치에 push 또는 tag(v*) push
+# 동작:
+#   1. ARM64 Docker 이미지 빌드 (Jetson Nano 아키텍처)
+#   2. ghcr.io에 :latest 및 버전 태그로 push
+#   3. Jetson Nano의 Watchtower가 변경 감지 → 자동 컨테이너 교체
+
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'         # v1.0.0, v1.2.3 형태의 릴리즈 태그
+  pull_request:
+    branches:
+      - main         # PR은 빌드만 (push 없음)
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ylee0004
+  REPO: projecthailai
+
+jobs:
+  build-and-push:
+    name: Build ${{ matrix.service }} for ARM64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # ghcr.io push 권한
+
+    strategy:
+      # 두 서비스를 병렬 빌드
+      matrix:
+        service: [perception, control]
+
+    steps:
+      # 소스 체크아웃
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # QEMU 설정 — x86 GitHub runner에서 ARM64 이미지 빌드 가능하게
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      # Docker Buildx 설정 — 멀티아키텍처 빌드 드라이버
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ghcr.io 로그인 (GitHub token 사용 — 별도 secret 불필요)
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 이미지 태그 결정
+      # - main push → :latest
+      # - v1.0.0 tag push → :latest, :v1.0.0, :1.0.0
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.service }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # ARM64 이미지 빌드 및 push
+      # context: 프로젝트 루트 (ros2_ws/src 포함)
+      # file: 각 서비스 Dockerfile
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/${{ matrix.service }}/Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions 캐시로 빌드 속도 향상
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

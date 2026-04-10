@@ -1,0 +1,70 @@
+# docker-compose.yml — Project Hail AI
+#
+# 서비스 구성:
+#   perception  — 얼굴 감지 (MediaPipe → /face/offset publish)
+#   control     — 서보 제어 (/face/offset subscribe → PCA9685)
+#   watchtower  — OTA 자동 업데이트 (ghcr.io 폴링 → 컨테이너 재시작)
+#
+# OTA 흐름: GitHub Actions → ghcr.io → Watchtower → 컨테이너 자동 교체
+
+services:
+
+  perception:
+    image: ghcr.io/ylee0004/projecthailai-perception:latest
+    container_name: hailai_perception
+    restart: unless-stopped
+    # ROS2 DDS 통신을 위해 host 네트워크 사용 (컨테이너 간 topic 공유)
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=0
+    # 웹캠 도착 후 /dev/video0 마운트 활성화
+    # devices:
+    #   - /dev/video0:/dev/video0
+    command: >
+      ros2 run perception face_detector_node
+      --ros-args -p source:=webcam -p show_preview:=false
+    labels:
+      # Watchtower가 이 컨테이너를 모니터링하도록 설정
+      com.centurylinklabs.watchtower.enable: "true"
+
+  control:
+    image: ghcr.io/ylee0004/projecthailai-control:latest
+    container_name: hailai_control
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=0
+    # PCA9685 I2C 접근을 위한 디바이스 마운트
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+    # dry_run:=true → 실제 서보 없이 로직만 테스트
+    # dry_run:=false → PCA9685 실제 제어 (하드웨어 연결 후)
+    command: >
+      ros2 run control servo_controller_node
+      --ros-args -p dry_run:=true
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    depends_on:
+      - perception
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: hailai_watchtower
+    restart: unless-stopped
+    volumes:
+      # Docker 소켓 마운트 — Watchtower가 컨테이너를 제어하기 위해 필요
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ghcr.io 인증 정보
+      - /root/.docker/config.json:/config.json:ro
+    environment:
+      # 300초(5분)마다 새 이미지 확인
+      - WATCHTOWER_POLL_INTERVAL=300
+      # label이 있는 컨테이너만 업데이트
+      - WATCHTOWER_LABEL_ENABLE=true
+      # 업데이트 후 오래된 이미지 자동 삭제
+      - WATCHTOWER_CLEANUP=true
+      # 업데이트 로그 상세 출력
+      - WATCHTOWER_DEBUG=false
+    labels:
+      # Watchtower가 자기 자신은 업데이트하지 않도록 설정
+      com.centurylinklabs.watchtower.enable: "false"
