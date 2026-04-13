@@ -17,12 +17,16 @@ services:
     network_mode: host
     environment:
       - ROS_DOMAIN_ID=0
-    # 웹캠 도착 후 /dev/video0 마운트 활성화
+    # 테스트 이미지 마운트 (웹캠 없을 때 source:=image 모드용)
+    volumes:
+      - ./test_assets:/test_assets:ro
+    # Phase 1: 테스트 이미지로 실행 (웹캠 없음)
+    # Phase 2: source:=webcam 으로 변경 + devices /dev/video0 활성화
     # devices:
     #   - /dev/video0:/dev/video0
     command: >
       ros2 run perception face_detector_node
-      --ros-args -p source:=webcam -p show_preview:=false
+      --ros-args -p source:=image -p file_path:=/test_assets/test_face.jpg -p show_preview:=false
     labels:
       # Watchtower가 이 컨테이너를 모니터링하도록 설정
       com.centurylinklabs.watchtower.enable: "true"
@@ -65,6 +69,8 @@ services:
       - WATCHTOWER_CLEANUP=true
       # 업데이트 로그 상세 출력
       - WATCHTOWER_DEBUG=false
+      # Docker API 버전 명시 (ARM64 watchtower 이미지의 구 클라이언트 버그 우회)
+      - DOCKER_API_VERSION=1.41
     labels:
       # Watchtower가 자기 자신은 업데이트하지 않도록 설정
       com.centurylinklabs.watchtower.enable: "false"
