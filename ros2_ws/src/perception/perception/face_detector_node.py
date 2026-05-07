@@ -16,6 +16,10 @@ Perception Node — Project Hail AI
   file_path   : 이미지 또는 비디오 파일 경로   (source가 image/video일 때 필수)
   publish_rate: topic publish 주기 (Hz)        (기본값: 30.0)
   show_preview: OpenCV 미리보기 창 표시 여부   (기본값: True)
+  device_index: 웹캠 장치 번호                 (source=webcam 전용, 기본값: 0)
+  width       : 웹캠 캡처 해상도 너비 (px)     (source=webcam 전용, 기본값: 1280)
+  height      : 웹캠 캡처 해상도 높이 (px)     (source=webcam 전용, 기본값: 720)
+  fps         : 웹캠 목표 프레임레이트          (source=webcam 전용, 기본값: 30)
 
 Phase 1: 정적 이미지/비디오 파일로 테스트 (웹캠 불필요)
 Phase 2: 실시간 웹캠 입력으로 전환 (source:=webcam 파라미터만 변경)
@@ -57,11 +61,20 @@ class FaceDetectorNode(Node):
         self.declare_parameter('file_path', '')         # 이미지/비디오 파일 경로
         self.declare_parameter('publish_rate', 30.0)    # publish 빈도 (Hz)
         self.declare_parameter('show_preview', True)    # OpenCV 미리보기 창 여부
+        # webcam 전용 파라미터
+        self.declare_parameter('device_index', 0)       # /dev/videoN 장치 번호
+        self.declare_parameter('width', 1280)           # 캡처 해상도 너비
+        self.declare_parameter('height', 720)           # 캡처 해상도 높이
+        self.declare_parameter('fps', 30)               # 목표 프레임레이트
 
         self.source = self.get_parameter('source').value
         self.file_path = self.get_parameter('file_path').value
         self.publish_rate = self.get_parameter('publish_rate').value
         self.show_preview = self.get_parameter('show_preview').value
+        self._device_index = self.get_parameter('device_index').value
+        self._width = self.get_parameter('width').value
+        self._height = self.get_parameter('height').value
+        self._fps = self.get_parameter('fps').value
 
         # ── ROS2 Publisher 생성 ─────────────────────────────────────────
         # Control 노드가 subscribe할 topic '/face/offset'에 FaceOffset 메시지를 발행
@@ -97,6 +110,13 @@ class FaceDetectorNode(Node):
             f'FaceDetectorNode started | source={self.source} | rate={self.publish_rate}Hz'
         )
 
+    def _validate_device_index(self):
+        """device_index 타입/범위 사전 검증 — 음수나 비정수는 V4L2 미정의 동작 유발"""
+        if not isinstance(self._device_index, int):
+            raise TypeError(f'device_index must be int, got {type(self._device_index).__name__}')
+        if self._device_index < 0:
+            raise ValueError(f'device_index must be >= 0, got {self._device_index}')
+
     def _init_source(self):
         """
         입력 소스 초기화
@@ -111,11 +131,25 @@ class FaceDetectorNode(Node):
           이미지는 imread()가 더 안정적.
         """
         if self.source == 'webcam':
-            # /dev/video0 장치에 연결 (USB 웹캠 기본 장치 번호)
-            self.cap = cv2.VideoCapture(0)
+            self._validate_device_index()
+            # Jetson OpenCV는 GStreamer 빌드라 default backend가 CSI(nvarguscamerasrc)부터
+            # 시도해 USB 웹캠 열기에 실패함. CAP_V4L2 backend를 명시해야 함.
+            self.cap = cv2.VideoCapture(self._device_index, cv2.CAP_V4L2)
             if not self.cap.isOpened():
-                raise RuntimeError('Cannot open webcam')
-            self.get_logger().info('Using webcam (device 0)')
+                raise RuntimeError(f'Cannot open webcam (device {self._device_index})')
+            # fourcc를 width/height/fps보다 먼저 설정해야 함.
+            # YUYV(기본) 대신 MJPG를 사용해야 USB 2.0 대역폭 제한 내에서 30 fps 가능.
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            self.cap.set(cv2.CAP_PROP_FPS, self._fps)
+            # 첫 몇 프레임은 하드웨어 초기화 중이라 실패할 수 있으므로 warm-up
+            for _ in range(5):
+                self.cap.read()
+            self.get_logger().info(
+                f'Using webcam (device {self._device_index}) '
+                f'MJPG {self._width}x{self._height}@{self._fps}fps'
+            )
 
         elif self.source == 'image':
             if not self.file_path:
@@ -137,89 +171,109 @@ class FaceDetectorNode(Node):
         else:
             raise ValueError(f'Unknown source: {self.source}')
 
+    @staticmethod
+    def detect_face_offset(frame, detector):
+        """
+        프레임에서 얼굴을 감지하고 오프셋을 계산해 dict로 반환.
+
+        image/webcam 양쪽 분기에서 공유하는 순수 함수.
+        ROS2·FaceOffset 메시지에 의존하지 않으므로 pytest에서 직접 호출 가능.
+
+        Args:
+            frame   : BGR numpy 배열
+            detector: MediaPipe FaceDetection 인스턴스
+
+        Returns:
+            dict with keys: detected(bool), x(float), y(float), confidence(float)
+              x: -1.0(좌) ~ +1.0(우), y: -1.0(하) ~ +1.0(상)
+        """
+        h, w = frame.shape[:2]
+        frame_center_x = w / 2
+        frame_center_y = h / 2
+
+        # BGR → RGB (MediaPipe 요구 포맷)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = detector.process(rgb)
+
+        result = {'detected': False, 'x': 0.0, 'y': 0.0, 'confidence': 0.0}
+
+        if results.detections:
+            # 여러 얼굴 중 confidence 최고인 것 선택
+            best = max(results.detections, key=lambda d: d.score[0])
+            bbox = best.location_data.relative_bounding_box
+
+            # bounding box 비율값(0~1) → 픽셀 좌표 변환
+            face_cx = (bbox.xmin + bbox.width / 2) * w
+            face_cy = (bbox.ymin + bbox.height / 2) * h
+
+            # 화면 중앙 대비 -1.0~+1.0 정규화
+            # OpenCV Y축은 아래로 증가하므로 y는 부호 반전해 위쪽을 양수로
+            result['x'] = (face_cx - frame_center_x) / frame_center_x
+            result['y'] = -((face_cy - frame_center_y) / frame_center_y)
+            result['confidence'] = float(best.score[0])
+            result['detected'] = True
+
+        return result
+
+    def _acquire_frame(self):
+        """
+        현재 source 설정에 따라 프레임 한 장을 획득해 반환.
+        실패하면 None 반환.
+        """
+        if self.source == 'image':
+            # 정적 이미지: 매번 복사본 사용 (원본 보존)
+            return self.static_frame.copy()
+
+        ret, frame = self.cap.read()
+        if not ret:
+            if self.source == 'video':
+                # 비디오 끝에 도달하면 처음으로 되감기 (루프 재생)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if not ret:
+                return None
+        return frame
+
     def process_frame(self):
         """
         핵심 처리 루프 — 타이머에 의해 매 주기마다 호출됨
 
         처리 순서:
-          1. 입력 소스에서 프레임(이미지) 획득
-          2. BGR → RGB 변환 (MediaPipe는 RGB 입력 필요)
-          3. MediaPipe로 얼굴 감지 실행
-          4. 감지된 얼굴의 중심점 계산
-          5. 화면 중앙 대비 오프셋을 -1.0 ~ 1.0으로 정규화
-          6. FaceOffset 메시지 구성 후 publish
-          7. (선택) OpenCV 미리보기 창에 결과 시각화
+          1. 입력 소스에서 프레임 획득 (_acquire_frame)
+          2. MediaPipe 얼굴 감지 + 오프셋 계산 (detect_face_offset)
+          3. FaceOffset 메시지 구성 후 /face/offset topic에 publish
+          4. (선택) OpenCV 미리보기 창에 결과 시각화
         """
         # ── Step 1: 프레임 획득 ─────────────────────────────────────────
-        if self.source == 'image':
-            # 정적 이미지: 매번 복사본 사용 (원본 보존)
-            frame = self.static_frame.copy()
-        else:
-            ret, frame = self.cap.read()
-            if not ret:
-                if self.source == 'video':
-                    # 비디오 끝에 도달하면 처음으로 되감기 (루프 재생)
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = self.cap.read()
-                if not ret:
-                    self.get_logger().warn('Cannot read frame')
-                    return
+        frame = self._acquire_frame()
+        if frame is None:
+            self.get_logger().warn('Cannot read frame')
+            return
 
-        # 화면 크기 및 중앙 좌표 계산
-        h, w = frame.shape[:2]
-        frame_center_x = w / 2   # 예: 640x480이면 center_x = 320
-        frame_center_y = h / 2   # 예: 640x480이면 center_y = 240
+        # ── Step 2: 얼굴 감지 + 오프셋 계산 (공유 함수) ────────────────
+        detection = self.detect_face_offset(frame, self.detector)
 
-        # ── Step 2: BGR → RGB 변환 ──────────────────────────────────────
-        # OpenCV는 BGR 포맷, MediaPipe는 RGB 포맷을 요구하므로 변환 필요
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # ── Step 3: MediaPipe 얼굴 감지 실행 ────────────────────────────
-        # results.detections: 감지된 얼굴 목록 (없으면 None 또는 빈 리스트)
-        results = self.detector.process(rgb)
-
-        # ── Step 4~6: 메시지 구성 및 publish ────────────────────────────
-        # 기본값: 얼굴 미감지 상태로 초기화
+        # ── Step 3: FaceOffset 메시지 구성 후 publish ───────────────────
         msg = FaceOffset()
-        msg.detected = False
-        msg.x = 0.0
-        msg.y = 0.0
-        msg.confidence = 0.0
-
-        if results.detections:
-            # 여러 얼굴이 감지됐을 경우 confidence가 가장 높은 것 선택
-            best = max(results.detections, key=lambda d: d.score[0])
-
-            # bounding box는 0.0~1.0 비율값 (픽셀 아님)
-            # 예: xmin=0.3, width=0.2이면 화면 30%~50% 구간에 얼굴 있음
-            bbox = best.location_data.relative_bounding_box
-
-            # 얼굴 중심점을 픽셀 좌표로 변환
-            face_cx = (bbox.xmin + bbox.width / 2) * w
-            face_cy = (bbox.ymin + bbox.height / 2) * h
-
-            # 화면 중앙 기준 오프셋을 -1.0 ~ 1.0으로 정규화
-            # x: 양수 = 오른쪽, 음수 = 왼쪽
-            # y: 양수 = 위쪽,   음수 = 아래쪽 (화면 Y축 반전 주의)
-            #    OpenCV Y축은 아래로 증가하므로 부호를 반전해야 직관적
-            msg.x = (face_cx - frame_center_x) / frame_center_x
-            msg.y = -((face_cy - frame_center_y) / frame_center_y)
-            msg.confidence = float(best.score[0])
-            msg.detected = True
-
-            if self.show_preview:
-                # 감지 결과 bounding box 그리기
-                self.mp_draw.draw_detection(frame, best)
-                # 얼굴 중심점 표시 (초록 원)
-                cv2.circle(frame, (int(face_cx), int(face_cy)), 5, (0, 255, 0), -1)
+        msg.detected = detection['detected']
+        msg.x = detection['x']
+        msg.y = detection['y']
+        msg.confidence = detection['confidence']
 
         # topic에 메시지 발행 — Control 노드가 이것을 받아 서보를 제어
         self.publisher.publish(msg)
 
-        # ── Step 7: 미리보기 창 (선택) ──────────────────────────────────
+        # ── Step 4: 미리보기 창 (선택) ──────────────────────────────────
         if self.show_preview:
-            status = f'x={msg.x:.2f} y={msg.y:.2f} conf={msg.confidence:.2f}' \
-                     if msg.detected else 'No face'
+            if msg.detected:
+                h, w = frame.shape[:2]
+                # 오프셋 역산으로 픽셀 좌표 복원 (detect_face_offset와 역연산)
+                face_cx = (msg.x * (w / 2)) + (w / 2)
+                face_cy = (-msg.y * (h / 2)) + (h / 2)
+                cv2.circle(frame, (int(face_cx), int(face_cy)), 5, (0, 255, 0), -1)
+                status = f'x={msg.x:.2f} y={msg.y:.2f} conf={msg.confidence:.2f}'
+            else:
+                status = 'No face'
             cv2.putText(frame, status, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.imshow('Face Detector', frame)
