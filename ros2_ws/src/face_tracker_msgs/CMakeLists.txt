@@ -23,6 +23,8 @@ find_package(rosidl_default_generators REQUIRED)
 # 새로운 메시지 추가 시 이 블록에 경로를 추가
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceOffset.msg"
+  "msg/FaceDirection.msg"
+  DEPENDENCIES builtin_interfaces
 )
 
 ament_package()

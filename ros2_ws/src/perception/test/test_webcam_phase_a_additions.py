@@ -6,7 +6,7 @@
 # 실행: pytest ros2_ws/src/perception/test/ -v
 #
 # 테스트 범위:
-#   TC-A1.  MediaPipe smoke test — PC(WSL) 환경에서 FaceDetection 인스턴스 생성 가능 확인
+#   TC-A1.  MediaPipe smoke test — PC(WSL) 환경에서 FaceMesh 인스턴스 생성 가능 확인
 #   TC-A2.  device_index 경계값 — 음수 입력 시 ValueError 발생 확인
 #   TC-A3.  device_index 경계값 — 문자열 입력 시 TypeError 발생 확인
 #   TC-A4.  device_index 경계값 — 0은 정상 (ValueError 없음)
@@ -38,25 +38,36 @@ def _blank_bgr(h=480, w=640):
     return np.zeros((h, w, 3), dtype=np.uint8)
 
 
-def _make_mock_detection(rel_xmin, rel_ymin, rel_w, rel_h, score=0.9):
+def _make_mock_face_mesh_results(rel_x_min, rel_y_min, rel_x_max, rel_y_max):
     """
-    MediaPipe detection 결과를 흉내 내는 Mock 객체 생성.
+    MediaPipe FaceMesh 결과를 흉내 내는 Mock 객체 생성.
 
-    rel_xmin, rel_ymin, rel_w, rel_h : 0~1 비율값 (relative bounding box)
-    반환 객체: results.detections 리스트 원소와 동일한 인터페이스.
+    Face Mesh는 per-landmark normalized(0~1) 좌표를 반환한다.
+    bbox 영역 안에 균등하게 4개의 가상 landmark를 배치해
+    min/max bbox 계산이 의도한 범위를 덮도록 한다.
+
+    rel_x_min, rel_y_min, rel_x_max, rel_y_max : 0~1 비율값
     """
-    bbox = MagicMock()
-    bbox.xmin = rel_xmin
-    bbox.ymin = rel_ymin
-    bbox.width = rel_w
-    bbox.height = rel_h
+    # bbox 꼭짓점 4점을 landmark로 배치
+    corners = [
+        (rel_x_min, rel_y_min),
+        (rel_x_max, rel_y_min),
+        (rel_x_min, rel_y_max),
+        (rel_x_max, rel_y_max),
+    ]
+    landmarks = []
+    for x, y in corners:
+        lm = MagicMock()
+        lm.x = x
+        lm.y = y
+        lm.z = 0.0
+        landmarks.append(lm)
 
-    detection = MagicMock()
-    detection.score = [score]
-    detection.location_data.relative_bounding_box = bbox
+    face_lm = MagicMock()
+    face_lm.landmark = landmarks
 
     results = MagicMock()
-    results.detections = [detection]
+    results.multi_face_landmarks = [face_lm]
     return results
 
 
@@ -66,12 +77,13 @@ def _make_mock_detection(rel_xmin, rel_ymin, rel_w, rel_h, score=0.9):
 
 def test_mediapipe_smoke_test_on_wsl_pc():
     """
-    PC(WSL) 환경에서 MediaPipe FaceDetection 인스턴스가 정상 생성되는지 확인.
-    ARM64 wheel 이슈와 분리해 PC 환경 이상 여부를 탐지.
+    PC(WSL) 환경에서 MediaPipe FaceMesh 인스턴스가 정상 생성되는지 확인.
+    Phase B에서 FaceDetection → FaceMesh로 교체됨.
     """
     import mediapipe as mp
-    det = mp.solutions.face_detection.FaceDetection(
-        model_selection=0, min_detection_confidence=0.5
+    det = mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True, max_num_faces=1,
+        refine_landmarks=False, min_detection_confidence=0.5,
     )
     assert det is not None
     det.close()
@@ -103,8 +115,6 @@ def test_device_index_negative_raises_value_error():
     """
     node = _node_with_device_index(-1)
     with pytest.raises(ValueError, match='device_index'):
-        # VideoCapture 실제 호출 없이 검증 가능하도록 _init_source 내 guard에 의존
-        # guard가 없으면 이 테스트가 실패 → Implementation에 guard 추가 요청
         node._validate_device_index()
 
 
@@ -122,22 +132,23 @@ def test_device_index_zero_is_valid():
     device_index=0 은 정상 값 — 예외 없이 통과해야 함.
     """
     node = _node_with_device_index(0)
-    # _validate_device_index 가 없으면 AttributeError → guard 추가 필요 신호
     node._validate_device_index()  # 예외 없음 확인
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TC-A5 ~ TC-A8: detect_face_offset Y/X 부호 정확성 (Mock detection)
+# TC-A5 ~ TC-A8: detect_face_offset Y/X 부호 정확성 (Mock FaceMesh results)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_detect_face_offset_y_positive_when_face_at_top():
     """
     얼굴이 화면 상단에 위치하면 y > 0 이어야 함.
     (OpenCV Y축은 아래 방향 증가 → 상단 위치 = face_cy < frame_center_y → y 부호 반전 → 양수)
+    상단 bbox: y_min=0.0, y_max=0.1 → face_cy = 0.05 * 480 = 24 < 240
     """
     frame = _blank_bgr(h=480, w=640)
-    # 상단: rel_ymin=0.0, rel_h=0.1 → face_cy = 0.05 * 480 = 24 < 240
-    mock_results = _make_mock_detection(rel_xmin=0.45, rel_ymin=0.0, rel_w=0.1, rel_h=0.1)
+    mock_results = _make_mock_face_mesh_results(
+        rel_x_min=0.40, rel_y_min=0.0, rel_x_max=0.60, rel_y_max=0.1
+    )
 
     mock_detector = MagicMock()
     mock_detector.process.return_value = mock_results
@@ -152,10 +163,12 @@ def test_detect_face_offset_y_negative_when_face_at_bottom():
     """
     얼굴이 화면 하단에 위치하면 y < 0 이어야 함.
     face_cy > frame_center_y → 부호 반전 → 음수
+    하단 bbox: y_min=0.9, y_max=1.0 → face_cy = 0.95 * 480 = 456 > 240
     """
     frame = _blank_bgr(h=480, w=640)
-    # 하단: rel_ymin=0.9, rel_h=0.1 → face_cy = 0.95 * 480 = 456 > 240
-    mock_results = _make_mock_detection(rel_xmin=0.45, rel_ymin=0.9, rel_w=0.1, rel_h=0.1)
+    mock_results = _make_mock_face_mesh_results(
+        rel_x_min=0.40, rel_y_min=0.9, rel_x_max=0.60, rel_y_max=1.0
+    )
 
     mock_detector = MagicMock()
     mock_detector.process.return_value = mock_results
@@ -170,10 +183,12 @@ def test_detect_face_offset_x_negative_when_face_at_left():
     """
     얼굴이 화면 좌측에 위치하면 x < 0 이어야 함.
     face_cx < frame_center_x → x 음수
+    좌측 bbox: x_min=0.0, x_max=0.1 → face_cx = 0.05 * 640 = 32 < 320
     """
     frame = _blank_bgr(h=480, w=640)
-    # 좌측: rel_xmin=0.0, rel_w=0.1 → face_cx = 0.05 * 640 = 32 < 320
-    mock_results = _make_mock_detection(rel_xmin=0.0, rel_ymin=0.45, rel_w=0.1, rel_h=0.1)
+    mock_results = _make_mock_face_mesh_results(
+        rel_x_min=0.0, rel_y_min=0.40, rel_x_max=0.1, rel_y_max=0.60
+    )
 
     mock_detector = MagicMock()
     mock_detector.process.return_value = mock_results
@@ -188,10 +203,12 @@ def test_detect_face_offset_x_positive_when_face_at_right():
     """
     얼굴이 화면 우측에 위치하면 x > 0 이어야 함.
     face_cx > frame_center_x → x 양수
+    우측 bbox: x_min=0.9, x_max=1.0 → face_cx = 0.95 * 640 = 608 > 320
     """
     frame = _blank_bgr(h=480, w=640)
-    # 우측: rel_xmin=0.9, rel_w=0.1 → face_cx = 0.95 * 640 = 608 > 320
-    mock_results = _make_mock_detection(rel_xmin=0.9, rel_ymin=0.45, rel_w=0.1, rel_h=0.1)
+    mock_results = _make_mock_face_mesh_results(
+        rel_x_min=0.9, rel_y_min=0.40, rel_x_max=1.0, rel_y_max=0.60
+    )
 
     mock_detector = MagicMock()
     mock_detector.process.return_value = mock_results
@@ -217,7 +234,6 @@ def test_init_source_image_missing_file_raises_runtime_error(tmp_path):
     node.cap = None
     node.static_frame = None
 
-    # get_logger stub
     logger_stub = MagicMock()
     node.get_logger = lambda: logger_stub
 
@@ -229,7 +245,6 @@ def test_init_source_image_existing_file_loads_frame(tmp_path):
     """
     image 모드에서 유효한 이미지 파일을 주면 static_frame에 numpy 배열이 로드되어야 함.
     """
-    # 1x1 흰색 BGR JPEG 생성
     img_path = tmp_path / 'test_img.png'
     cv2.imwrite(str(img_path), np.ones((10, 10, 3), dtype=np.uint8) * 200)
 

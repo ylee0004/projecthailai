@@ -27,12 +27,18 @@ from perception.face_detector_node import FaceDetectorNode  # noqa: E402
 @pytest.fixture(scope='module')
 def mp_detector():
     """
-    MediaPipe FaceDetection 인스턴스 (모듈 범위, 한 번만 생성).
+    MediaPipe FaceMesh 인스턴스 (모듈 범위, 한 번만 생성).
+    Phase B에서 Face Mesh로 교체 — detect_face_offset과 동일한 설정 사용.
     테스트 종료 후 컨텍스트 매니저로 자동 해제.
     """
     import mediapipe as mp
-    face_det = mp.solutions.face_detection
-    with face_det.FaceDetection(model_selection=0, min_detection_confidence=0.5) as det:
+    face_mesh = mp.solutions.face_mesh
+    with face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+    ) as det:
         yield det
 
 
@@ -89,11 +95,16 @@ def test_no_face_on_solid_color_image(mp_detector):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_return_dict_has_required_keys(mp_detector):
-    """detect_face_offset 반환 dict에 4개 키가 모두 있어야 함"""
+    """
+    detect_face_offset 반환 dict에 Phase A 핵심 4 키 + Phase B 추가 키가 모두 있어야 함.
+    Phase B에서 face_cx, face_cy, landmarks 키가 추가됨.
+    """
     frame = _blank_bgr()
     result = FaceDetectorNode.detect_face_offset(frame, mp_detector)
 
-    assert set(result.keys()) == {'detected', 'x', 'y', 'confidence'}
+    required_keys = {'detected', 'x', 'y', 'confidence', 'face_cx', 'face_cy', 'landmarks'}
+    assert required_keys.issubset(result.keys()), \
+        f'누락된 키: {required_keys - result.keys()}'
 
 
 def test_return_types(mp_detector):

@@ -49,3 +49,11 @@ if 'face_tracker_msgs' not in sys.modules:
         y: float = 0.0
         confidence: float = 0.0
     msg_mod.FaceOffset = _FaceOffsetStub
+
+    class _FaceDirectionStub:
+        yaw_deg: float = 0.0
+        direction: str = 'CENTER'
+        confidence: float = 0.0
+        detected: bool = False
+        stamp = None
+    msg_mod.FaceDirection = _FaceDirectionStub
