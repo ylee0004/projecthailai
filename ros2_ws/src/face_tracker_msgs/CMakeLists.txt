@@ -19,6 +19,10 @@ find_package(ament_cmake REQUIRED)
 # rosidl_default_generators: .msg 파일을 각 언어 코드로 변환하는 도구
 find_package(rosidl_default_generators REQUIRED)
 
+# builtin_interfaces: FaceDirection.msg의 'builtin_interfaces/Time stamp' 필드를 위해
+# DEPENDENCIES에 등록하기 전에 cmake가 패키지를 찾을 수 있어야 함
+find_package(builtin_interfaces REQUIRED)
+
 # 생성할 메시지 파일 목록
 # 새로운 메시지 추가 시 이 블록에 경로를 추가
 rosidl_generate_interfaces(${PROJECT_NAME}
