@@ -27,8 +27,10 @@ Perception Node — Project Hail AI
 """
 
 import math
+import threading
 import time
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rclpy
 from rclpy.node import Node
@@ -79,6 +81,9 @@ class FaceDetectorNode(Node):
         self.declare_parameter('preview_enable', True)
         self.declare_parameter('preview_rate_hz', 5.0)
         self.declare_parameter('preview_jpeg_quality', 70)
+        # MJPEG HTTP streamer 파라미터 (Foxglove 우회 — 브라우저 직접 접속)
+        # 0 = 비활성, 8080 = http://<nano>:8080/stream.mjpg
+        self.declare_parameter('mjpeg_http_port', 8080)
 
         self.source = self.get_parameter('source').value
         self.file_path = self.get_parameter('file_path').value
@@ -93,6 +98,7 @@ class FaceDetectorNode(Node):
         self._preview_enable = self.get_parameter('preview_enable').value
         self._preview_rate_hz = self.get_parameter('preview_rate_hz').value
         self._preview_jpeg_quality = self.get_parameter('preview_jpeg_quality').value
+        self._mjpeg_http_port = self.get_parameter('mjpeg_http_port').value
 
         # ── ROS2 Publisher 생성 ─────────────────────────────────────────
         self.publisher = self.create_publisher(FaceOffset, '/face/offset', 10)
@@ -115,6 +121,11 @@ class FaceDetectorNode(Node):
         self.last_direction = 'CENTER'
         self.last_main_fps_estimate = 0.0
         self._frame_times = deque(maxlen=30)  # rolling FPS 측정용
+        # MJPEG HTTP server 용: publish_preview에서 만든 최신 JPEG bytes
+        self._latest_jpeg = None
+        self._latest_jpeg_lock = threading.Lock()
+        self._mjpeg_server = None
+        self._mjpeg_thread = None
 
         # ── MediaPipe Face Mesh 초기화 ───────────────────────────────────
         # FaceDetection → FaceMesh 로 업그레이드 (landmark 468점 제공)
@@ -147,10 +158,15 @@ class FaceDetectorNode(Node):
                 self.publish_preview,
             )
 
+        # MJPEG HTTP streamer (Foxglove 우회) — preview enable + port>0 일 때만
+        if self._preview_enable:
+            self.start_mjpeg_server()
+
         self.get_logger().info(
             f'FaceDetectorNode started | source={self.source} | rate={self.publish_rate}Hz'
             f' | yaw_threshold={self._yaw_threshold_deg}° | ema_alpha={self._yaw_ema_alpha}'
             f' | preview={self._preview_enable} @ {self._preview_rate_hz}Hz'
+            f' | mjpeg_http_port={self._mjpeg_http_port}'
         )
 
     def _validate_device_index(self):
@@ -449,19 +465,120 @@ class FaceDetectorNode(Node):
             '.jpg', annotated,
             [cv2.IMWRITE_JPEG_QUALITY, self._preview_jpeg_quality],
         )
+        jpeg_bytes = buf.tobytes()
 
         msg = CompressedImage()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'camera'
         msg.format = 'jpeg'
-        msg.data = buf.tobytes()
+        msg.data = jpeg_bytes
         self.preview_pub.publish(msg)
+
+        # MJPEG HTTP streamer 가 사용할 latest JPEG 갱신
+        with self._latest_jpeg_lock:
+            self._latest_jpeg = jpeg_bytes
+
+    def start_mjpeg_server(self):
+        """
+        MJPEG HTTP 스트리머 — Foxglove 우회용.
+        브라우저에서 http://<nano>:<port>/ 또는 /stream.mjpg 로 접속 시
+        publish_preview 가 만드는 최신 JPEG (오버레이 포함) 을 보여준다.
+        """
+        if self._mjpeg_http_port is None or self._mjpeg_http_port <= 0:
+            return
+        node = self  # closure 용
+
+        class MJPEGHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args, **_kwargs):  # 콘솔 spam 차단
+                pass
+
+            def _send_index(self):
+                html = (b"<!doctype html><html><head><title>Hail AI preview</title>"
+                        b"<style>body{margin:0;background:#111;color:#eee;font-family:sans-serif}"
+                        b"img{max-width:100%;display:block}</style></head>"
+                        b"<body><img src='/stream.mjpg' alt='live stream'></body></html>")
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def _send_snapshot(self):
+                with node._latest_jpeg_lock:
+                    data = node._latest_jpeg
+                if not data:
+                    self.send_error(503, 'no frame yet')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _send_stream(self):
+                boundary = b'--frame'
+                self.send_response(200)
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header(
+                    'Content-Type',
+                    'multipart/x-mixed-replace; boundary=frame',
+                )
+                self.end_headers()
+                try:
+                    while True:
+                        with node._latest_jpeg_lock:
+                            data = node._latest_jpeg
+                        if data:
+                            self.wfile.write(boundary + b'\r\n')
+                            self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                            self.wfile.write(
+                                b'Content-Length: ' + str(len(data)).encode() + b'\r\n\r\n')
+                            self.wfile.write(data + b'\r\n')
+                        # preview_rate_hz 와 동기 — 살짝 더 자주 polling 해서 누락 방지
+                        time.sleep(max(0.05, 1.0 / max(node._preview_rate_hz, 1.0)))
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+            def do_GET(self):
+                if self.path in ('/', '/index.html'):
+                    self._send_index()
+                elif self.path.startswith('/stream.mjpg'):
+                    self._send_stream()
+                elif self.path.startswith('/snapshot.jpg'):
+                    self._send_snapshot()
+                else:
+                    self.send_error(404)
+
+        try:
+            self._mjpeg_server = ThreadingHTTPServer(
+                ('0.0.0.0', self._mjpeg_http_port), MJPEGHandler)
+        except OSError as e:
+            self.get_logger().warn(
+                f'MJPEG HTTP server bind failed on port {self._mjpeg_http_port}: {e}')
+            self._mjpeg_server = None
+            return
+        self._mjpeg_thread = threading.Thread(
+            target=self._mjpeg_server.serve_forever,
+            daemon=True,
+            name='mjpeg-http')
+        self._mjpeg_thread.start()
+        self.get_logger().info(
+            f'MJPEG HTTP server started: http://0.0.0.0:{self._mjpeg_http_port}/ '
+            f'(stream: /stream.mjpg, snapshot: /snapshot.jpg)')
 
     def destroy_node(self):
         """
         노드 종료 시 리소스 해제
         VideoCapture 객체와 OpenCV 창을 닫아 메모리 누수 방지
         """
+        if self._mjpeg_server is not None:
+            try:
+                self._mjpeg_server.shutdown()
+                self._mjpeg_server.server_close()
+            except Exception:
+                pass
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
