@@ -27,6 +27,8 @@ Perception Node — Project Hail AI
 """
 
 import math
+import time
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
@@ -36,6 +38,7 @@ import mediapipe as mp
 import numpy as np
 
 from face_tracker_msgs.msg import FaceDirection, FaceOffset
+from sensor_msgs.msg import CompressedImage
 from perception.yaw_estimator import YawSmoother, classify_direction, estimate_yaw_from_landmarks
 
 
@@ -72,6 +75,10 @@ class FaceDetectorNode(Node):
         # Phase B 파라미터
         self.declare_parameter('yaw_threshold_deg', 25.0)
         self.declare_parameter('yaw_ema_alpha', 0.3)
+        # Preview (Foxglove) 파라미터
+        self.declare_parameter('preview_enable', True)
+        self.declare_parameter('preview_rate_hz', 5.0)
+        self.declare_parameter('preview_jpeg_quality', 70)
 
         self.source = self.get_parameter('source').value
         self.file_path = self.get_parameter('file_path').value
@@ -83,13 +90,31 @@ class FaceDetectorNode(Node):
         self._fps = self.get_parameter('fps').value
         self._yaw_threshold_deg = self.get_parameter('yaw_threshold_deg').value
         self._yaw_ema_alpha = self.get_parameter('yaw_ema_alpha').value
+        self._preview_enable = self.get_parameter('preview_enable').value
+        self._preview_rate_hz = self.get_parameter('preview_rate_hz').value
+        self._preview_jpeg_quality = self.get_parameter('preview_jpeg_quality').value
 
         # ── ROS2 Publisher 생성 ─────────────────────────────────────────
         self.publisher = self.create_publisher(FaceOffset, '/face/offset', 10)
         self.direction_pub = self.create_publisher(FaceDirection, '/face/direction', 10)
 
+        # ── Preview publisher (Foxglove 시각화용, preview_enable=True일 때만) ──
+        self.preview_pub = None
+        if self._preview_enable:
+            self.preview_pub = self.create_publisher(
+                CompressedImage, '/camera/preview/compressed', 10
+            )
+
         # ── Phase B: YawSmoother 초기화 ─────────────────────────────────
         self.yaw_smoother = YawSmoother(alpha=self._yaw_ema_alpha)
+
+        # ── Preview 상태 변수 ────────────────────────────────────────────
+        self.last_frame = None          # 가장 최근 BGR frame
+        self.last_detection = None      # detect_face_offset 결과 dict
+        self.last_yaw_smoothed = float('nan')
+        self.last_direction = 'CENTER'
+        self.last_main_fps_estimate = 0.0
+        self._frame_times = deque(maxlen=30)  # rolling FPS 측정용
 
         # ── MediaPipe Face Mesh 초기화 ───────────────────────────────────
         # FaceDetection → FaceMesh 로 업그레이드 (landmark 468점 제공)
@@ -115,9 +140,17 @@ class FaceDetectorNode(Node):
             self.process_frame,
         )
 
+        # ── Preview timer (preview_enable=True일 때만) ───────────────────
+        if self._preview_enable:
+            self.create_timer(
+                1.0 / self._preview_rate_hz,
+                self.publish_preview,
+            )
+
         self.get_logger().info(
             f'FaceDetectorNode started | source={self.source} | rate={self.publish_rate}Hz'
             f' | yaw_threshold={self._yaw_threshold_deg}° | ema_alpha={self._yaw_ema_alpha}'
+            f' | preview={self._preview_enable} @ {self._preview_rate_hz}Hz'
         )
 
     def _validate_device_index(self):
@@ -266,6 +299,13 @@ class FaceDetectorNode(Node):
           5. FaceDirection 메시지 publish (/face/direction)
           6. (선택) OpenCV 미리보기 창에 결과 시각화
         """
+        # ── FPS 측정 (rolling 1초 window) ──────────────────────────────
+        self._frame_times.append(time.time())
+        if len(self._frame_times) >= 2:
+            elapsed = self._frame_times[-1] - self._frame_times[0]
+            if elapsed > 0:
+                self.last_main_fps_estimate = (len(self._frame_times) - 1) / elapsed
+
         # ── Step 1: 프레임 획득 ─────────────────────────────────────────
         frame = self._acquire_frame()
         if frame is None:
@@ -276,6 +316,10 @@ class FaceDetectorNode(Node):
 
         # ── Step 2: 얼굴 감지 + 오프셋 계산 ────────────────────────────
         detection = self.detect_face_offset(frame, self.detector)
+
+        # ── 상태 변수 업데이트 (publish_preview에서 사용) ────────────────
+        self.last_frame = frame
+        self.last_detection = detection
 
         # ── Step 3: FaceOffset publish ───────────────────────────────────
         now = self.get_clock().now().to_msg()
@@ -297,6 +341,10 @@ class FaceDetectorNode(Node):
 
         yaw_smoothed = self.yaw_smoother.update(yaw_raw)
         direction = classify_direction(yaw_smoothed, self._yaw_threshold_deg)
+
+        # 상태 변수 업데이트 (publish_preview에서 사용)
+        self.last_yaw_smoothed = yaw_smoothed
+        self.last_direction = direction
 
         # ── Step 5: FaceDirection publish ────────────────────────────────
         dir_msg = FaceDirection()
@@ -325,6 +373,89 @@ class FaceDetectorNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.imshow('Face Detector', frame)
             cv2.waitKey(1)
+
+    def publish_preview(self):
+        """
+        5Hz throttle preview publisher — Foxglove Studio 시각화용.
+
+        last_frame에 yaw/detection 정보를 오버레이한 뒤
+        /camera/preview/compressed (CompressedImage, JPEG)로 publish.
+        warm-up 중(last_frame=None)이면 skip.
+        """
+        if self.last_frame is None:
+            return
+
+        detection = self.last_detection or {'detected': False, 'confidence': 0.0, 'landmarks': None}
+        detected = detection['detected']
+        confidence = detection['confidence']
+        yaw = self.last_yaw_smoothed
+        direction = self.last_direction
+        main_fps = self.last_main_fps_estimate
+
+        annotated = self.last_frame.copy()
+        frame_h, frame_w = annotated.shape[:2]
+
+        if detected:
+            # 얼굴 박스 (landmark bbox, green)
+            landmarks = detection.get('landmarks')
+            if landmarks is not None:
+                xs = [lm.x for lm in landmarks]
+                ys = [lm.y for lm in landmarks]
+                x1 = int(min(xs) * frame_w)
+                y1 = int(min(ys) * frame_h)
+                x2 = int(max(xs) * frame_w)
+                y2 = int(max(ys) * frame_h)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                # 6개 yaw landmark 점 (yellow)
+                for idx in [1, 152, 33, 263, 61, 291]:
+                    lm = landmarks[idx]
+                    px, py = int(lm.x * frame_w), int(lm.y * frame_h)
+                    cv2.circle(annotated, (px, py), 3, (0, 255, 255), -1)
+
+            # 화면 중심 → yaw 방향 화살표
+            cx, cy = frame_w // 2, frame_h // 2
+            arrow_len = int(abs(yaw) * 4) if not math.isnan(yaw) else 0
+            if direction == 'LEFT':
+                arrow_color = (0, 0, 255)    # red (BGR)
+                cv2.arrowedLine(annotated, (cx, cy), (cx - arrow_len, cy), arrow_color, 2)
+            elif direction == 'RIGHT':
+                arrow_color = (255, 0, 0)    # blue (BGR)
+                cv2.arrowedLine(annotated, (cx, cy), (cx + arrow_len, cy), arrow_color, 2)
+            else:
+                arrow_color = (0, 255, 0)    # green
+                cv2.arrowedLine(annotated, (cx, cy), (cx, cy), arrow_color, 2)
+
+        # 텍스트 오버레이 (왼쪽 위, white with black outline)
+        yaw_str = f'{yaw:+.1f}' if not math.isnan(yaw) else 'nan'
+        lines = [
+            f'yaw: {yaw_str} deg',
+            f'dir: {direction}',
+            f'det: {detected}  conf: {confidence:.2f}',
+            f'fps: {main_fps:.1f}',
+        ]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.65
+        thickness = 2
+        for i, line in enumerate(lines):
+            org = (10, 28 + i * 26)
+            # black outline
+            cv2.putText(annotated, line, org, font, font_scale, (0, 0, 0), thickness + 1)
+            # white text
+            cv2.putText(annotated, line, org, font, font_scale, (255, 255, 255), thickness)
+
+        # JPEG encode
+        _, buf = cv2.imencode(
+            '.jpg', annotated,
+            [cv2.IMWRITE_JPEG_QUALITY, self._preview_jpeg_quality],
+        )
+
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'camera'
+        msg.format = 'jpeg'
+        msg.data = buf.tobytes()
+        self.preview_pub.publish(msg)
 
     def destroy_node(self):
         """

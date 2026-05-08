@@ -57,3 +57,19 @@ if 'face_tracker_msgs' not in sys.modules:
         detected: bool = False
         stamp = None
     msg_mod.FaceDirection = _FaceDirectionStub
+
+# sensor_msgs 계열 (CompressedImage — preview publisher용)
+if 'sensor_msgs' not in sys.modules:
+    _make_stub('sensor_msgs')
+    sensor_msg_mod = _make_stub('sensor_msgs.msg')
+
+    class _HeaderStub:
+        stamp = None
+        frame_id: str = ''
+
+    class _CompressedImageStub:
+        def __init__(self):
+            self.header = _HeaderStub()
+            self.format: str = ''
+            self.data: bytes = b''
+    sensor_msg_mod.CompressedImage = _CompressedImageStub

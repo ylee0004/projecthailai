@@ -79,3 +79,20 @@ services:
     labels:
       # Watchtower가 자기 자신은 업데이트하지 않도록 설정
       com.centurylinklabs.watchtower.enable: "false"
+
+  foxglove_bridge:
+    image: ros:humble
+    container_name: hailai_foxglove_bridge
+    restart: unless-stopped
+    # DDS multicast로 perception 토픽 자동 발견 (별도 포트 매핑 불필요)
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=0
+    # 매 시작 시 apt install (~30초). 추후 prebuild 이미지로 대체 가능
+    command: >
+      bash -c "apt-get update && apt-get install -y ros-humble-foxglove-bridge &&
+               source /opt/ros/humble/setup.bash &&
+               ros2 run foxglove_bridge foxglove_bridge --ros-args -p port:=8765"
+    labels:
+      # OTA 자동 업데이트 대상 제외
+      com.centurylinklabs.watchtower.enable: "false"
